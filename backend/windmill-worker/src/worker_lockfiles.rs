@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{create_dir_all, remove_dir_all};
+use std::sync::Arc;
 
 #[cfg(feature = "python")]
 use crate::ansible_executor::{get_git_repos_lock, AnsibleDependencyLocks};
@@ -9,7 +10,8 @@ use itertools::Itertools;
 use serde_json::value::RawValue;
 use serde_json::{from_value, json, Value};
 use sha2::Digest;
-use sqlx::types::Json;
+use sqlx::{types::Json, Connection as _, PgConnection};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 use windmill_common::assets::{
     clear_static_asset_usage, insert_static_asset_usage, AssetUsageKind,
@@ -39,7 +41,8 @@ use windmill_common::{
     DB,
 };
 pub use windmill_dep_map::{
-    extract_referenced_paths, extract_relative_imports, process_relative_imports,
+    extract_referenced_paths, extract_relative_imports, trigger_script_dependents,
+    update_script_dependency_map,
 };
 use windmill_git_sync::{
     handle_deployment_metadata, tally_deployed_object_changes, DeployedObject,
@@ -55,6 +58,46 @@ lazy_static::lazy_static! {
     static ref WMDEBUG_NO_NEW_APP_VERSION_ON_DJ: bool = std::env::var("WMDEBUG_NO_NEW_APP_VERSION_ON_DJ").is_ok();
     static ref WMDEBUG_NO_COMPONENTS_TO_RELOCK: bool = std::env::var("WMDEBUG_NO_COMPONENTS_TO_RELOCK").is_ok();
     static ref WMDEBUG_NO_RELOCK_SKIP_OPTIMIZATION: bool = std::env::var("WMDEBUG_NO_RELOCK_SKIP_OPTIMIZATION").is_ok();
+    static ref DEPENDENCY_RELOCK_SLOTS: Arc<Semaphore> = Arc::new(Semaphore::new(32));
+}
+
+struct DependencyRelockGuard {
+    _conn: PgConnection,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl DependencyRelockGuard {
+    async fn acquire(db: &DB, w_id: &str, path: &str) -> Result<Self> {
+        let slot = DEPENDENCY_RELOCK_SLOTS
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::internal_err(format!("dependency relock slots closed: {e}")))?;
+        // Keep this off-pool: waiting relocks must not consume the connections the holder needs,
+        // and dropping the session releases the advisory lock on every exit path.
+        let mut conn = PgConnection::connect_with(&db.connect_options()).await?;
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(format!("dependency_relock:{w_id}:{path}"))
+            .execute(&mut conn)
+            .await?;
+        Ok(Self { _conn: conn, _slot: slot })
+    }
+}
+
+fn dependency_result_is_unchanged(
+    script_data: &cache::ScriptData,
+    lock: &str,
+    updated_modules: Option<&Value>,
+) -> bool {
+    script_data.lock.as_deref() == Some(lock)
+        && updated_modules.is_none_or(|updated| {
+            script_data
+                .modules
+                .as_ref()
+                .and_then(|modules| serde_json::to_value(modules).ok())
+                .as_ref()
+                == Some(updated)
+        })
 }
 
 use crate::common::{MaybeLock, OccupancyMetrics};
@@ -283,6 +326,10 @@ pub async fn handle_dependency_job(
         job.runnable_path()
     );
     let script_path = job.runnable_path();
+    let triggered_by_relative_import = job
+        .args
+        .as_ref()
+        .is_some_and(|args| args.get("triggered_by_relative_import").is_some());
 
     // A build pass reads the same script data but writes none of the deploy state below,
     // including the `lock_error_logs` stamp on a fetch failure: the version it builds is
@@ -296,12 +343,32 @@ pub async fn handle_dependency_job(
         *deployment_tallied = true;
     }
 
+    let _relock_guard = if triggered_by_relative_import && !is_build_job {
+        Some(DependencyRelockGuard::acquire(db, &job.workspace_id, script_path).await?)
+    } else {
+        None
+    };
+
     // `JobKind::Dependencies` job store either:
     // - A saved script `hash` in the `script_hash` column.
     // - Preview raw lock and code in the `queue` or `job` table.
     let script_data = &match job.runnable_id {
-        Some(hash) => match cache::script::fetch(&Connection::from(db.clone()), hash).await {
-            Ok(d) => Cow::Owned(d.0),
+        Some(hash) => match if triggered_by_relative_import {
+            cache::script::fetch_script_from_db(db, hash, std::panic::Location::caller())
+                .await
+                .map(|raw| {
+                    Arc::new(cache::ScriptData {
+                        lock: raw.lock,
+                        code: raw.content,
+                        modules: raw.modules,
+                    })
+                })
+        } else {
+            cache::script::fetch(&Connection::from(db.clone()), hash)
+                .await
+                .map(|d| d.0)
+        } {
+            Ok(d) => Cow::Owned(d),
             Err(e) => {
                 if !is_build_job {
                     let logs2 = sqlx::query_scalar!(
@@ -347,12 +414,6 @@ pub async fn handle_dependency_job(
         )
         .await;
     }
-
-    let triggered_by_relative_import = job
-        .args
-        .as_ref()
-        .map(|x| x.get("triggered_by_relative_import").is_some())
-        .unwrap_or_default();
 
     // Extract temp_script_refs from job args (path -> hash mapping for temp storage)
     let temp_script_refs: Option<HashMap<String, String>> = job
@@ -471,32 +532,66 @@ pub async fn handle_dependency_job(
             let updated_modules_json = updated_modules
                 .as_ref()
                 .and_then(|m| serde_json::to_value(m).ok());
-            sqlx::query!(
-                "WITH update_lock AS (
-                    UPDATE script SET lock = $1, modules = COALESCE($6, modules) WHERE hash = $2 AND workspace_id = $3
+            let dependency_result_unchanged = triggered_by_relative_import
+                && dependency_result_is_unchanged(
+                    script_data,
+                    &content,
+                    updated_modules_json.as_ref(),
+                );
+            if dependency_result_unchanged {
+                sqlx::query!(
+                    "INSERT INTO lock_hash (workspace_id, path, lockfile_hash)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (workspace_id, path)
+                     DO UPDATE SET lockfile_hash = EXCLUDED.lockfile_hash",
+                    w_id,
+                    script_path,
+                    lockfile_hash,
                 )
-                INSERT INTO lock_hash (workspace_id, path, lockfile_hash)
-                VALUES ($3, $4, $5)
-                ON CONFLICT (workspace_id, path) DO UPDATE SET lockfile_hash = $5",
-                &content,
-                &current_hash.0,
+                .execute(db)
+                .await?;
+            } else {
+                sqlx::query!(
+                    "WITH update_lock AS (
+                        UPDATE script SET lock = $1, modules = COALESCE($6, modules) WHERE hash = $2 AND workspace_id = $3
+                    )
+                    INSERT INTO lock_hash (workspace_id, path, lockfile_hash)
+                    VALUES ($3, $4, $5)
+                    ON CONFLICT (workspace_id, path) DO UPDATE SET lockfile_hash = $5",
+                    &content,
+                    &current_hash.0,
+                    w_id,
+                    script_path,
+                    &lockfile_hash,
+                    updated_modules_json
+                )
+                .execute(db)
+                .await?;
+
+                // The row is already committed, so invalidate before any later fallible work.
+                cache::script::invalidate(current_hash);
+                windmill_common::invalidate_deployed_script_hash_cache(w_id, script_path);
+            }
+
+            update_script_dependency_map(
+                db,
                 w_id,
                 script_path,
-                &lockfile_hash,
-                updated_modules_json
+                &parent_path,
+                &script_data.code,
+                &job.script_lang,
             )
-            .execute(db)
             .await?;
 
-            // `lock` has been updated; invalidate the cache.
-            // Since only worker that ran this Dependency Job has the cache
-            // we do not need to think about invalidating cache for other workers.
-            cache::script::invalidate(current_hash);
-            // The version only became runnable now, so this process still resolves the path to
-            // the one before it. Only the runnable-hash cache: the import-side caches ignore the
-            // lock, so evicting this process' half of that pair here would key a bundle by a
-            // hash whose content cache has not caught up.
-            windmill_common::invalidate_deployed_script_hash_cache(w_id, script_path);
+            if dependency_result_unchanged {
+                let log_msg =
+                    "\nSkipping dependency deployment - generated lock and modules unchanged";
+                tracing::info!(workspace_id = %w_id, job_id = %job.id, path = %script_path, "{log_msg}");
+                append_logs(&job.id, w_id, log_msg.to_string(), &db.into()).await;
+                return Ok(to_raw_value_owned(
+                    json!({ "status": "Successful lock file generation", "lock": content }),
+                ));
+            }
 
             if let Err(e) = handle_deployment_metadata(
                 &job.permissioned_as_email,
@@ -522,16 +617,13 @@ pub async fn handle_dependency_job(
             // that fails below must not make the caller record it a second time.
             *deployment_tallied = true;
 
-            process_relative_imports(
+            trigger_script_dependents(
                 db,
-                Some(job.id),
                 job.args.as_ref(),
                 &job.workspace_id,
                 script_path,
                 parent_path,
                 deployment_message,
-                &script_data.code,
-                &job.script_lang,
                 &job.permissioned_as_email,
                 &job.created_by,
                 &job.permissioned_as,
@@ -3321,4 +3413,70 @@ async fn add_lock_header(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use windmill_common::scripts::ScriptModule;
+
+    #[sqlx::test]
+    async fn dependency_relock_guard_serializes_workspace_path(db: DB) -> Result<()> {
+        let first = DependencyRelockGuard::acquire(&db, "workspace", "f/test/importer").await?;
+
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(100),
+            DependencyRelockGuard::acquire(&db, "workspace", "f/test/importer"),
+        )
+        .await;
+        assert!(waiting.is_err(), "a second relock acquired the same path");
+
+        drop(first);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            DependencyRelockGuard::acquire(&db, "workspace", "f/test/importer"),
+        )
+        .await
+        .expect("the relock did not acquire after the first session closed")?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_dependency_result_includes_module_locks() {
+        let modules = HashMap::from([(
+            "helper.ts".to_string(),
+            ScriptModule {
+                content: "export const value = 1".to_string(),
+                language: ScriptLang::Bun,
+                lock: Some("module-lock".to_string()),
+            },
+        )]);
+        let script_data = cache::ScriptData {
+            lock: Some("script-lock".to_string()),
+            code: "export async function main() {}".to_string(),
+            modules: Some(modules.clone()),
+        };
+
+        let same_modules = serde_json::to_value(&modules).unwrap();
+        assert!(dependency_result_is_unchanged(
+            &script_data,
+            "script-lock",
+            Some(&same_modules),
+        ));
+
+        let mut changed_modules = modules;
+        changed_modules.get_mut("helper.ts").unwrap().lock = Some("changed".to_string());
+        assert!(!dependency_result_is_unchanged(
+            &script_data,
+            "script-lock",
+            Some(&serde_json::to_value(changed_modules).unwrap()),
+        ));
+        assert!(!dependency_result_is_unchanged(
+            &script_data,
+            "changed-script-lock",
+            Some(&same_modules),
+        ));
+    }
 }

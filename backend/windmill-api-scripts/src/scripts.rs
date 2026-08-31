@@ -1884,6 +1884,21 @@ async fn create_script_internal<'c>(
     .execute(&mut *tx)
     .await?;
 
+    if let Some(lock) = lock.as_deref().filter(|lock| !lock.is_empty()) {
+        let lockfile_hash = hash_script(lock);
+        sqlx::query!(
+            "INSERT INTO lock_hash (workspace_id, path, lockfile_hash)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, path)
+             DO UPDATE SET lockfile_hash = EXCLUDED.lockfile_hash",
+            &w_id,
+            &ns.path,
+            lockfile_hash,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
     // Update ci_test_reference table for test scripts
     // Delete by both new and old path to handle renames
     let old_path = parent_hashes_and_perms.as_ref().map(|x| x.p_path.as_str());
