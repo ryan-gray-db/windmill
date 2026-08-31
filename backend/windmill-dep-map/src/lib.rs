@@ -141,71 +141,101 @@ pub async fn process_relative_imports(
     created_by: &str,
     permissioned_as: &str,
 ) -> error::Result<()> {
-    use scoped_dependency_map::ScopedDependencyMap;
-    use trigger_dependents::trigger_dependents_to_recompute_dependencies;
+    update_script_dependency_map(db, w_id, script_path, &parent_path, code, script_lang).await?;
+    trigger_script_dependents(
+        db,
+        args,
+        w_id,
+        script_path,
+        parent_path,
+        deployment_message,
+        permissioned_as_email,
+        created_by,
+        permissioned_as,
+    )
+    .await
+}
 
-    // TODO: Should be moved into handle_dependency_job body to be more consistent with how flows and apps are handled
-    {
-        let mut tx = db.begin().await?;
-        let mut dependency_map = ScopedDependencyMap::fetch_maybe_rearranged(
-            &w_id,
-            script_path,
-            "script",
-            &parent_path,
-            db,
+/// Refreshes the dependency-map snapshot for an already-authorized script mutation.
+///
+/// Callers must verify workspace access before passing workspace-scoped data.
+pub async fn update_script_dependency_map(
+    db: &sqlx::Pool<sqlx::Postgres>,
+    w_id: &str,
+    script_path: &str,
+    parent_path: &Option<String>,
+    code: &str,
+    script_lang: &Option<ScriptLang>,
+) -> error::Result<()> {
+    use scoped_dependency_map::ScopedDependencyMap;
+
+    let mut tx = db.begin().await?;
+    let mut dependency_map =
+        ScopedDependencyMap::fetch_maybe_rearranged(w_id, script_path, "script", parent_path, db)
+            .await?;
+
+    tx = dependency_map
+        .patch(
+            extract_referenced_paths(code, script_path, *script_lang),
+            // Ideally should be None, but due to current implementation will use empty string to represent None.
+            "".into(),
+            tx,
         )
         .await?;
 
-        tx = dependency_map
-            .patch(
-                extract_referenced_paths(&code, script_path, *script_lang),
-                // Ideally should be None, but due to current implementation will use empty string to represent None.
-                "".into(),
-                tx,
-            )
-            .await?;
+    dependency_map.dissolve(tx).await.commit().await?;
+    Ok(())
+}
 
-        dependency_map.dissolve(tx).await.commit().await?;
-    }
+/// Queues dependent recomputation after an already-authorized script mutation.
+///
+/// Callers must verify workspace access and the provenance of all identity parameters.
+pub async fn trigger_script_dependents(
+    db: &sqlx::Pool<sqlx::Postgres>,
+    args: Option<&Json<HashMap<String, Box<RawValue>>>>,
+    w_id: &str,
+    script_path: &str,
+    parent_path: Option<String>,
+    deployment_message: Option<String>,
+    permissioned_as_email: &str,
+    created_by: &str,
+    permissioned_as: &str,
+) -> error::Result<()> {
+    use scoped_dependency_map::ScopedDependencyMap;
+    use trigger_dependents::trigger_dependents_to_recompute_dependencies;
 
+    let mut already_visited = args
+        .and_then(|x| x.get("already_visited"))
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v.get()).ok())
+        .unwrap_or_default();
+
+    let importers = ScopedDependencyMap::get_dependents(script_path, w_id, db).await?;
+
+    already_visited.push(script_path.to_string());
+    match tokio::time::timeout(
+        core::time::Duration::from_secs(60),
+        Box::pin(trigger_dependents_to_recompute_dependencies(
+            w_id,
+            importers,
+            deployment_message,
+            parent_path,
+            permissioned_as_email,
+            created_by,
+            permissioned_as,
+            db,
+            already_visited,
+        )),
+    )
+    .warn_after_seconds(10)
+    .await
     {
-        let mut already_visited = args
-            .map(|x| {
-                x.get("already_visited")
-                    .map(|v| serde_json::from_str::<Vec<String>>(v.get()).ok())
-                    .flatten()
-            })
-            .flatten()
-            .unwrap_or_default();
-
-        let importers = ScopedDependencyMap::get_dependents(script_path, w_id, db).await?;
-
-        already_visited.push(script_path.to_string());
-        match tokio::time::timeout(
-            core::time::Duration::from_secs(60),
-            Box::pin(trigger_dependents_to_recompute_dependencies(
-                w_id,
-                importers,
-                deployment_message,
-                parent_path,
-                permissioned_as_email,
-                created_by,
-                permissioned_as,
-                db,
-                already_visited,
-            )),
-        )
-        .warn_after_seconds(10)
-        .await
-        {
-            Ok(Err(e)) => {
-                tracing::error!(%e, "error triggering dependents to recompute dependencies")
-            }
-            Err(e) => {
-                tracing::error!(%e, "triggering dependents to recompute dependencies has timed out")
-            }
-            _ => {}
+        Ok(Err(e)) => {
+            tracing::error!(%e, "error triggering dependents to recompute dependencies")
         }
+        Err(e) => {
+            tracing::error!(%e, "triggering dependents to recompute dependencies has timed out")
+        }
+        _ => {}
     }
 
     Ok(())

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO lock_hash (workspace_id, path, lockfile_hash)\n             VALUES ($1, $2, $3)\n             ON CONFLICT (workspace_id, path)\n             DO UPDATE SET lockfile_hash = EXCLUDED.lockfile_hash",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "73cfe2e09c355e51fb2760e2c0b4f10879d9a0bd351f941c52463036d19148bc"
+}
